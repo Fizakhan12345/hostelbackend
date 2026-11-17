@@ -44,7 +44,7 @@ app.use('/api/payments',    paymentRoutes);
 app.use('/api/reviews',     reviewRoutes);
 app.use('/api/favorites',   favRouter);
 app.use('/api/dashboard',   dashRouter);
-
+app.use('/api/owner', require('./routes/owner'));
 // ── Health Check ──────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   res.json({

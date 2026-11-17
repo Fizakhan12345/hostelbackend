@@ -1,221 +1,201 @@
-// routes/auth.user.js
-const express        = require('express');
-const bcrypt         = require('bcryptjs');
-const jwt            = require('jsonwebtoken');
-const { v4: uuidv4 } = require('uuid');
-const pool           = require('../config/db');
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const pool = require('../config/db');
+const { requireAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
-// ── Auth Middleware (inline — avoids circular import) ─────
-const authUser = async (req, res, next) => {
+const uploadDir = path.join(__dirname, '..', process.env.UPLOAD_DIR || 'uploads');
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadDir),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname) || '.jpg';
+    cb(null, `profile-${req.user.id}-${Date.now()}${ext}`);
+  },
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: Number(process.env.MAX_FILE_SIZE) || 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ok = /image\/(jpeg|jpg|png|webp)/.test(file.mimetype);
+    cb(ok ? null : new Error('Only JPG, PNG or WEBP images are allowed.'), ok);
+  },
+});
+
+function signUserToken(user) {
+  return jwt.sign(
+    { id: user.id, email: user.email, type: 'user' },
+    process.env.JWT_SECRET,
+    { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+  );
+}
+
+function publicUser(u) {
+  const { password_hash, otp_code, otp_expires, reset_token, reset_expires, ...safe } = u;
+  return safe;
+}
+
+router.post('/register', async (req, res, next) => {
   try {
-    const header = req.headers.authorization;
-    if (!header || !header.startsWith('Bearer '))
-      return res.status(401).json({ success: false, message: 'No token provided' });
+    const { full_name, email, phone, password, gender } = req.body;
+    if (!full_name || !email || !phone || !password) {
+      return res.status(400).json({ success: false, message: 'Full name, email, phone and password are required.' });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 8 characters.' });
+    }
 
-    const token   = header.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    const [rows] = await pool.query(
-      'SELECT id, full_name, email, phone, is_active FROM users WHERE id = ?',
-      [decoded.id]
+    const [[existing]] = await pool.query(
+      'SELECT id FROM users WHERE email = :email OR phone = :phone',
+      { email, phone }
     );
+    if (existing) {
+      return res.status(409).json({ success: false, message: 'An account with this email or phone already exists.' });
+    }
 
-    if (!rows.length || !rows[0].is_active)
-      return res.status(401).json({ success: false, message: 'User not found or inactive' });
-
-    req.user = rows[0];
-    next();
-  } catch (err) {
-    return res.status(401).json({ success: false, message: 'Invalid or expired token' });
-  }
-};
-
-// Helper
-const genOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
-
-// ── POST /api/auth/register ───────────────────────────────
-router.post('/register', async (req, res) => {
-  const { full_name, email, phone, password, gender } = req.body;
-
-  if (!full_name || !email || !phone || !password)
-    return res.status(400).json({ success: false, message: 'All fields are required' });
-
-  try {
-    const [exist] = await pool.query(
-      'SELECT id FROM users WHERE email = ? OR phone = ?', [email, phone]
-    );
-    if (exist.length)
-      return res.status(409).json({ success: false, message: 'Email or phone already registered' });
-
-    const hash       = await bcrypt.hash(password, 12);
-    const otp        = genOTP();
-    const otpExpires = new Date(Date.now() + 10 * 60 * 1000);
+    const passwordHash = await bcrypt.hash(password, 12);
 
     const [result] = await pool.query(
-      `INSERT INTO users (full_name, email, phone, password_hash, gender, otp_code, otp_expires)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [full_name, email, phone, hash, gender || null, otp, otpExpires]
+      `INSERT INTO users (full_name, email, phone, password_hash, gender, is_verified, is_active)
+       VALUES (:full_name, :email, :phone, :password_hash, :gender, 0, 1)`,
+      { full_name, email, phone, password_hash: passwordHash, gender: gender || null }
     );
 
-    console.log(`OTP for ${email}: ${otp}`);
+    const [[user]] = await pool.query('SELECT * FROM users WHERE id = :id', { id: result.insertId });
+    const token = signUserToken(user);
 
-    res.status(201).json({
-      success: true,
-      message: 'Registered! Please verify OTP sent to your email.',
-      user_id: result.insertId
-    });
+    res.status(201).json({ success: true, message: 'Account created!', token, user: publicUser(user) });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    next(err);
   }
 });
 
-// ── POST /api/auth/verify-otp ─────────────────────────────
-router.post('/verify-otp', async (req, res) => {
-  const { user_id, otp } = req.body;
+router.post('/login', async (req, res, next) => {
   try {
-    const [rows] = await pool.query(
-      'SELECT id, otp_code, otp_expires FROM users WHERE id = ?', [user_id]
-    );
-    if (!rows.length)
-      return res.status(404).json({ success: false, message: 'User not found' });
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ success: false, message: 'Email and password are required.' });
+    }
 
-    const user = rows[0];
-    if (user.otp_code !== otp || new Date() > new Date(user.otp_expires))
-      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
-
-    await pool.query(
-      'UPDATE users SET is_verified = 1, otp_code = NULL, otp_expires = NULL WHERE id = ?',
-      [user_id]
-    );
-
-    res.json({ success: true, message: 'Email verified! You can now login.' });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// ── POST /api/auth/login ──────────────────────────────────
-router.post('/login', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password)
-    return res.status(400).json({ success: false, message: 'Email and password required' });
-
-  try {
-    const [rows] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
-    if (!rows.length)
-      return res.status(401).json({ success: false, message: 'Invalid credentials' });
-
-    const user = rows[0];
-    if (!user.is_active)
-      return res.status(403).json({ success: false, message: 'Account is inactive' });
+    const [[user]] = await pool.query('SELECT * FROM users WHERE email = :email', { email });
+    if (!user) {
+      return res.status(401).json({ success: false, message: 'Invalid email or password.' });
+    }
+    if (!user.is_active) {
+      return res.status(403).json({ success: false, message: 'This account has been deactivated.' });
+    }
 
     const match = await bcrypt.compare(password, user.password_hash);
-    if (!match)
-      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    if (!match) {
+      return res.status(401).json({ success: false, message: 'Invalid email or password.' });
+    }
 
-    const token = jwt.sign(
-      { id: user.id, email: user.email },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
-    );
-
-    res.json({
-      success:  true,
-      message:  'Login successful',
-      token,
-      user: {
-        id:          user.id,
-        full_name:   user.full_name,
-        email:       user.email,
-        phone:       user.phone,
-        is_verified: user.is_verified,
-        profile_pic: user.profile_pic
-      }
-    });
+    const token = signUserToken(user);
+    res.json({ success: true, message: 'Login successful', token, user: publicUser(user) });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    next(err);
   }
 });
 
-// ── POST /api/auth/forgot-password ───────────────────────
-router.post('/forgot-password', async (req, res) => {
-  const { email } = req.body;
+router.get('/me', requireAuth, async (req, res, next) => {
   try {
-    const [rows] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
-    if (!rows.length)
-      return res.status(404).json({ success: false, message: 'Email not registered' });
-
-    const token   = uuidv4();
-    const expires = new Date(Date.now() + 60 * 60 * 1000);
-
-    await pool.query(
-      'UPDATE users SET reset_token = ?, reset_expires = ? WHERE email = ?',
-      [token, expires, email]
-    );
-
-    console.log(`Reset link: ${process.env.FRONTEND_URL}/reset-password?token=${token}`);
-    res.json({ success: true, message: 'Password reset link sent to your email' });
+    const [[user]] = await pool.query('SELECT * FROM users WHERE id = :id', { id: req.user.id });
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+    res.json({ success: true, user: publicUser(user) });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    next(err);
   }
 });
 
-// ── POST /api/auth/reset-password ────────────────────────
-router.post('/reset-password', async (req, res) => {
-  const { token, new_password } = req.body;
+router.put('/profile', requireAuth, async (req, res, next) => {
   try {
-    const [rows] = await pool.query(
-      'SELECT id, reset_expires FROM users WHERE reset_token = ?', [token]
-    );
-    if (!rows.length)
-      return res.status(400).json({ success: false, message: 'Invalid reset token' });
+    const { full_name, phone, gender } = req.body;
 
-    if (new Date() > new Date(rows[0].reset_expires))
-      return res.status(400).json({ success: false, message: 'Reset token expired' });
+    if (phone) {
+      const [[taken]] = await pool.query(
+        'SELECT id FROM users WHERE phone = :phone AND id != :id',
+        { phone, id: req.user.id }
+      );
+      if (taken) return res.status(409).json({ success: false, message: 'That phone number is already in use.' });
+    }
 
-    const hash = await bcrypt.hash(new_password, 12);
-    await pool.query(
-      'UPDATE users SET password_hash = ?, reset_token = NULL, reset_expires = NULL WHERE id = ?',
-      [hash, rows[0].id]
-    );
-
-    res.json({ success: true, message: 'Password reset successfully' });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// ── GET /api/auth/me ──────────────────────────────────────
-router.get('/me', authUser, async (req, res) => {
-  try {
-    const [rows] = await pool.query(
-      'SELECT id, full_name, email, phone, gender, profile_pic, is_verified, created_at FROM users WHERE id = ?',
-      [req.user.id]
-    );
-    res.json({ success: true, user: rows[0] });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// ── PUT /api/auth/profile ─────────────────────────────────
-router.put('/profile', authUser, async (req, res) => {
-  const { full_name, phone, gender } = req.body;
-  try {
     await pool.query(
       `UPDATE users SET
-         full_name = COALESCE(?, full_name),
-         phone     = COALESCE(?, phone),
-         gender    = COALESCE(?, gender)
-       WHERE id = ?`,
-      [full_name, phone, gender, req.user.id]
+         full_name = COALESCE(:full_name, full_name),
+         phone     = COALESCE(:phone, phone),
+         gender    = COALESCE(:gender, gender)
+       WHERE id = :id`,
+      { full_name: full_name || null, phone: phone || null, gender: gender || null, id: req.user.id }
     );
-    res.json({ success: true, message: 'Profile updated successfully' });
+
+    const [[user]] = await pool.query('SELECT * FROM users WHERE id = :id', { id: req.user.id });
+    res.json({ success: true, message: 'Profile updated.', user: publicUser(user) });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    next(err);
   }
 });
 
+router.post('/profile/picture', requireAuth, upload.single('profile_pic'), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ success: false, message: 'No image file received.' });
+
+    const publicUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+    await pool.query('UPDATE users SET profile_pic = :url WHERE id = :id', { url: publicUrl, id: req.user.id });
+
+    res.json({ success: true, message: 'Profile picture updated.', profile_pic: publicUrl });
+  } catch (err) {
+    next(err);
+  }
+});
+// ── Change password ───────────────────────────────────────
+router.put('/password', requireAuth, async (req, res, next) => {
+  try {
+    const { current_password, new_password } = req.body;
+    if (!current_password || !new_password) {
+      return res.status(400).json({ success: false, message: 'Current and new password are required.' });
+    }
+    if (new_password.length < 8) {
+      return res.status(400).json({ success: false, message: 'New password must be at least 8 characters.' });
+    }
+
+    const [[user]] = await pool.query('SELECT password_hash FROM users WHERE id = :id', { id: req.user.id });
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+    const match = await bcrypt.compare(current_password, user.password_hash);
+    if (!match) return res.status(400).json({ success: false, message: 'Current password is incorrect.' });
+
+    const hash = await bcrypt.hash(new_password, 12);
+    await pool.query('UPDATE users SET password_hash = :hash WHERE id = :id', { hash, id: req.user.id });
+
+    res.json({ success: true, message: 'Password changed successfully.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── Deactivate account (soft delete: is_active = 0) ───────
+router.delete('/account', requireAuth, async (req, res, next) => {
+  try {
+    const { password } = req.body || {};
+    if (!password) return res.status(400).json({ success: false, message: 'Please enter your password to confirm.' });
+
+    const [[user]] = await pool.query('SELECT password_hash FROM users WHERE id = :id', { id: req.user.id });
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) return res.status(400).json({ success: false, message: 'Password is incorrect.' });
+
+    await pool.query('UPDATE users SET is_active = 0 WHERE id = :id', { id: req.user.id });
+    res.json({ success: true, message: 'Your account has been deactivated.' });
+  } catch (err) {
+    next(err);
+  }
+});
 module.exports = router;

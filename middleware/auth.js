@@ -1,6 +1,49 @@
 // middleware/auth.js
 const jwt  = require('jsonwebtoken');
 const pool = require('../config/db');
+function getTokenFromReq(req) {
+  const header = req.headers.authorization || '';
+  if (header.startsWith('Bearer ')) return header.slice(7);
+  return null;
+}
+
+/**
+ * requireAuth — blocks the request with 401 if no valid user JWT is present.
+ * Use on routes that must not work for anonymous visitors (favorites, bookings/my).
+ */
+function requireAuth(req, res, next) {
+  const token = getTokenFromReq(req);
+  if (!token) {
+    return res.status(401).json({ success: false, message: 'Please log in to continue.' });
+  }
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    if (payload.type !== 'user') {
+      return res.status(401).json({ success: false, message: 'Invalid session. Please log in again.' });
+    }
+    req.user = payload; // { id, email, type }
+    next();
+  } catch (err) {
+    return res.status(401).json({ success: false, message: 'Session expired. Please log in again.' });
+  }
+}
+
+/**
+ * optionalAuth — attaches req.user if a valid token is present, but never
+ * blocks the request. Use on routes like property detail, where a logged-in
+ * user should also get their `is_favorited` flag.
+ */
+function optionalAuth(req, res, next) {
+  const token = getTokenFromReq(req);
+  if (!token) return next();
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    if (payload.type === 'user') req.user = payload;
+  } catch (err) {
+    // silently ignore bad/expired token on optional routes
+  }
+  next();
+}
 
 const authUser = async (req, res, next) => {
   try {
@@ -53,4 +96,4 @@ const authAdmin = async (req, res, next) => {
   }
 };
 
-module.exports = { authUser, authAdmin };
+module.exports = { requireAuth, optionalAuth, authUser, authAdmin };

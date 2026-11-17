@@ -1,267 +1,157 @@
-// routes/properties.js
-const express              = require('express');
-const pool                 = require('../config/db');
-const { authAdmin, authUser } = require('../middleware/auth');
+const express = require('express');
+const pool = require('../config/db');
+const { optionalAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
-// GET /api/properties  (Public — Search & Filter)
-router.get('/', async (req, res) => {
+// ── GET /api/properties ─────────────────────────────────────
+// List + filter + search. Powers the "View All Properties" page.
+// Query params: city, gender (male|female|both), type (hostel|pg|apartment|room),
+// minPrice, maxPrice, q (search text), page, limit, sort (price_asc|price_desc|rating)
+router.get('/', async (req, res, next) => {
   try {
     const {
-      area, city, type, gender,
-      min_rent, max_rent, amenities,
-      is_featured, page = 1, limit = 12,
-      sort = 'created_at', order = 'DESC'
+      city, gender, type, minPrice, maxPrice, q,
+      page = 1, limit = 12, sort = 'featured',
     } = req.query;
 
-    let where  = ['p.is_active = 1'];
-    let params = [];
+    const where = ['p.is_active = 1'];
+    const params = {};
 
-    if (city)        { where.push('p.city = ?');               params.push(city); }
-    if (area)        { where.push('p.area LIKE ?');             params.push(`%${area}%`); }
-    if (type)        { where.push('p.property_type = ?');       params.push(type); }
-    if (gender)      { where.push('p.gender_allowed IN (?,?)'); params.push(gender, 'both'); }
-    if (min_rent)    { where.push('p.monthly_rent >= ?');       params.push(min_rent); }
-    if (max_rent)    { where.push('p.monthly_rent <= ?');       params.push(max_rent); }
-    if (is_featured) { where.push('p.is_featured = 1'); }
+    if (city) { where.push('p.city = :city'); params.city = city; }
+    if (gender && gender !== 'all') { where.push("(p.gender_allowed = :gender OR p.gender_allowed = 'both')"); params.gender = gender; }
+    if (type && type !== 'all') { where.push('p.property_type = :type'); params.type = type; }
+    if (minPrice) { where.push('p.monthly_rent >= :minPrice'); params.minPrice = Number(minPrice); }
+    if (maxPrice) { where.push('p.monthly_rent <= :maxPrice'); params.maxPrice = Number(maxPrice); }
+    if (q) {
+      where.push('(p.name LIKE :q OR p.area LIKE :q OR p.city LIKE :q)');
+      params.q = `%${q}%`;
+    }
 
-    const allowedSorts  = ['monthly_rent', 'avg_rating', 'created_at', 'views_count'];
-    const allowedOrders = ['ASC', 'DESC'];
-    const safeSort  = allowedSorts.includes(sort)            ? sort            : 'created_at';
-    const safeOrder = allowedOrders.includes(order.toUpperCase()) ? order.toUpperCase() : 'DESC';
+    const sortMap = {
+      price_asc: 'p.monthly_rent ASC',
+      price_desc: 'p.monthly_rent DESC',
+      rating: 'p.avg_rating DESC',
+      featured: 'p.is_featured DESC, p.avg_rating DESC',
+    };
+    const orderBy = sortMap[sort] || sortMap.featured;
 
-    const offset   = (parseInt(page) - 1) * parseInt(limit);
-    const whereStr = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const pageNum = Math.max(1, Number(page));
+    const limitNum = Math.min(50, Math.max(1, Number(limit)));
+    const offset = (pageNum - 1) * limitNum;
 
-    const query = `
-      SELECT
-        p.id, p.name, p.property_type, p.gender_allowed,
-        p.area, p.city, p.monthly_rent, p.security_deposit,
-        p.available_rooms, p.total_rooms, p.avg_rating, p.total_reviews,
-        p.is_verified, p.is_featured, p.created_at,
-        (SELECT image_url FROM property_images
-         WHERE property_id = p.id AND is_primary = 1 LIMIT 1) AS primary_image,
-        GROUP_CONCAT(DISTINCT am.name SEPARATOR ',') AS amenity_names
-      FROM properties p
-      LEFT JOIN property_amenities pa2 ON pa2.property_id = p.id
-      LEFT JOIN amenities am           ON am.id = pa2.amenity_id
-      ${whereStr}
-      GROUP BY p.id
-      ORDER BY p.${safeSort} ${safeOrder}
-      LIMIT ? OFFSET ?
-    `;
+    const whereSql = where.join(' AND ');
 
-    const [properties] = await pool.query(query, [...params, parseInt(limit), offset]);
+    const [rows] = await pool.query(
+      `SELECT
+         p.id, p.name, p.property_type, p.gender_allowed, p.area, p.city, p.state,
+         p.monthly_rent, p.avg_rating, p.total_reviews, p.is_verified, p.is_featured,
+         (SELECT image_url FROM property_images pi WHERE pi.property_id = p.id
+            ORDER BY pi.is_primary DESC, pi.sort_order ASC LIMIT 1) AS image,
+         (SELECT GROUP_CONCAT(a.name SEPARATOR ',') FROM property_amenities pa
+            JOIN amenities a ON a.id = pa.amenity_id WHERE pa.property_id = p.id) AS amenities
+       FROM properties p
+       WHERE ${whereSql}
+       ORDER BY ${orderBy}
+       LIMIT :limitNum OFFSET :offset`,
+      { ...params, limitNum, offset }
+    );
 
-    const [[countResult]] = await pool.query(
-      `SELECT COUNT(DISTINCT p.id) AS total FROM properties p ${whereStr}`,
+    const [[{ total }]] = await pool.query(
+      `SELECT COUNT(*) AS total FROM properties p WHERE ${whereSql}`,
       params
     );
 
+    const data = rows.map((r) => ({
+      ...r,
+      amenities: r.amenities ? r.amenities.split(',') : [],
+    }));
+
     res.json({
       success: true,
-      data: properties.map(p => ({
-        ...p,
-        amenity_names: p.amenity_names ? p.amenity_names.split(',') : []
-      })),
-      pagination: {
-        total:       countResult.total,
-        page:        parseInt(page),
-        limit:       parseInt(limit),
-        total_pages: Math.ceil(countResult.total / limit)
-      }
+      data,
+      pagination: { page: pageNum, limit: limitNum, total, totalPages: Math.ceil(total / limitNum) },
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    next(err);
   }
 });
 
-// GET /api/properties/admin/my-properties
-router.get('/admin/my-properties', authAdmin, async (req, res) => {
+// ── GET /api/properties/:id ─────────────────────────────────
+// Full detail page: images, amenities, rooms, latest approved reviews,
+// owner contact (for booking emails), and whether the current user
+// (if logged in) has favorited it.
+router.get('/:id', optionalAuth, async (req, res, next) => {
   try {
-    const [properties] = await pool.query(
-      `SELECT
-         p.*,
-         (SELECT image_url FROM property_images WHERE property_id = p.id AND is_primary = 1 LIMIT 1) AS primary_image,
-         COUNT(DISTINCT b.id) AS total_bookings,
-         SUM(CASE WHEN b.status = 'confirmed' THEN 1 ELSE 0 END) AS active_bookings
-       FROM properties p
-       LEFT JOIN bookings b ON b.property_id = p.id
-       WHERE p.admin_id = ?
-       GROUP BY p.id
-       ORDER BY p.created_at DESC`,
-      [req.admin.id]
-    );
-    res.json({ success: true, data: properties });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
+    const { id } = req.params;
 
-// GET /api/properties/:id  (Public — Single)
-router.get('/:id', async (req, res) => {
-  try {
-    const [rows] = await pool.query(
-      `SELECT
-         p.*,
-         a.full_name AS admin_name, a.phone AS admin_phone,
-         GROUP_CONCAT(DISTINCT am.name SEPARATOR '|') AS amenities
+    const [[property]] = await pool.query(
+      `SELECT p.*, a.full_name AS owner_name, a.email AS owner_email, a.phone AS owner_phone
        FROM properties p
        JOIN admins a ON a.id = p.admin_id
-       LEFT JOIN property_amenities pa ON pa.property_id = p.id
-       LEFT JOIN amenities am          ON am.id = pa.amenity_id
-       WHERE p.id = ? AND p.is_active = 1
-       GROUP BY p.id`,
-      [req.params.id]
+       WHERE p.id = :id AND p.is_active = 1`,
+      { id }
     );
 
-    if (!rows.length)
-      return res.status(404).json({ success: false, message: 'Property not found' });
+    if (!property) {
+      return res.status(404).json({ success: false, message: 'Property not found.' });
+    }
 
-    const [images]  = await pool.query('SELECT * FROM property_images WHERE property_id = ? ORDER BY sort_order', [req.params.id]);
-    const [rooms]   = await pool.query('SELECT * FROM rooms WHERE property_id = ? AND is_active = 1', [req.params.id]);
+    const [images] = await pool.query(
+      `SELECT id, image_url, is_primary FROM property_images
+       WHERE property_id = :id ORDER BY is_primary DESC, sort_order ASC`,
+      { id }
+    );
+
+    const [amenities] = await pool.query(
+      `SELECT a.id, a.name, a.category FROM property_amenities pa
+       JOIN amenities a ON a.id = pa.amenity_id WHERE pa.property_id = :id`,
+      { id }
+    );
+
+    const [rooms] = await pool.query(
+      `SELECT id, room_type, capacity, available, price_per_bed, daily_rate
+       FROM rooms WHERE property_id = :id AND is_active = 1`,
+      { id }
+    );
+
     const [reviews] = await pool.query(
-      `SELECT r.*, u.full_name, u.profile_pic
+      `SELECT r.id, r.rating, r.title, r.comment, r.created_at, u.full_name
        FROM reviews r JOIN users u ON u.id = r.user_id
-       WHERE r.property_id = ? AND r.is_approved = 1
+       WHERE r.property_id = :id AND r.is_approved = 1
        ORDER BY r.created_at DESC LIMIT 10`,
-      [req.params.id]
+      { id }
     );
 
-    await pool.query('UPDATE properties SET views_count = views_count + 1 WHERE id = ?', [req.params.id]);
+    let isFavorited = false;
+    if (req.user) {
+      const [[fav]] = await pool.query(
+        'SELECT 1 AS x FROM favorites WHERE user_id = :uid AND property_id = :id',
+        { uid: req.user.id, id }
+      );
+      isFavorited = !!fav;
+    }
 
-    const property = rows[0];
+    // Fire-and-forget view counter — never blocks the response.
+    pool.query('UPDATE properties SET views_count = views_count + 1 WHERE id = :id', { id }).catch(() => {});
+
+    // Don't leak the owner's contact directly to the client — it's only
+    // used server-side when a booking enquiry is created.
+    const { owner_email, owner_phone, ...publicProperty } = property;
+
     res.json({
       success: true,
       data: {
-        ...property,
-        amenities: property.amenities ? property.amenities.split('|') : [],
-        images, rooms, reviews
-      }
+        ...publicProperty,
+        images,
+        amenities,
+        rooms,
+        reviews,
+        is_favorited: isFavorited,
+      },
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// POST /api/properties  (Admin — Create)
-router.post('/', authAdmin, async (req, res) => {
-  const {
-    name, description, property_type, gender_allowed,
-    address, area, city, state, pincode,
-    latitude, longitude, total_rooms,
-    monthly_rent, security_deposit, amenity_ids
-  } = req.body;
-
-  if (!name || !property_type || !address || !monthly_rent)
-    return res.status(400).json({ success: false, message: 'Required fields missing' });
-
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-
-    const [result] = await conn.query(
-      `INSERT INTO properties
-         (admin_id, name, description, property_type, gender_allowed,
-          address, area, city, state, pincode, latitude, longitude,
-          total_rooms, available_rooms, monthly_rent, security_deposit)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        req.admin.id, name, description || null, property_type, gender_allowed || 'both',
-        address, area || '', city || 'Mumbai', state || 'Maharashtra', pincode || '',
-        latitude || null, longitude || null,
-        total_rooms || 1, total_rooms || 1, monthly_rent, security_deposit || 0
-      ]
-    );
-
-    const propId = result.insertId;
-
-    if (amenity_ids && amenity_ids.length) {
-      const amenRows = amenity_ids.map(aid => [propId, aid]);
-      await conn.query('INSERT INTO property_amenities (property_id, amenity_id) VALUES ?', [amenRows]);
-    }
-
-    await conn.commit();
-    res.status(201).json({
-      success:     true,
-      message:     'Property created! It will be visible after verification.',
-      property_id: propId
-    });
-  } catch (err) {
-    await conn.rollback();
-    res.status(500).json({ success: false, message: err.message });
-  } finally {
-    conn.release();
-  }
-});
-
-// PUT /api/properties/:id  (Admin — Update)
-router.put('/:id', authAdmin, async (req, res) => {
-  try {
-    const [rows] = await pool.query(
-      'SELECT id FROM properties WHERE id = ? AND admin_id = ?',
-      [req.params.id, req.admin.id]
-    );
-    if (!rows.length)
-      return res.status(403).json({ success: false, message: 'Property not found or access denied' });
-
-    const {
-      name, description, property_type, gender_allowed,
-      address, area, city, pincode,
-      monthly_rent, security_deposit, total_rooms, amenity_ids
-    } = req.body;
-
-    await pool.query(
-      `UPDATE properties SET
-         name             = COALESCE(?, name),
-         description      = COALESCE(?, description),
-         property_type    = COALESCE(?, property_type),
-         gender_allowed   = COALESCE(?, gender_allowed),
-         address          = COALESCE(?, address),
-         area             = COALESCE(?, area),
-         city             = COALESCE(?, city),
-         pincode          = COALESCE(?, pincode),
-         monthly_rent     = COALESCE(?, monthly_rent),
-         security_deposit = COALESCE(?, security_deposit),
-         total_rooms      = COALESCE(?, total_rooms)
-       WHERE id = ?`,
-      [
-        name, description, property_type, gender_allowed,
-        address, area, city, pincode,
-        monthly_rent, security_deposit, total_rooms,
-        req.params.id
-      ]
-    );
-
-    if (amenity_ids) {
-      await pool.query('DELETE FROM property_amenities WHERE property_id = ?', [req.params.id]);
-      if (amenity_ids.length) {
-        const amenRows = amenity_ids.map(aid => [req.params.id, aid]);
-        await pool.query('INSERT INTO property_amenities (property_id, amenity_id) VALUES ?', [amenRows]);
-      }
-    }
-
-    res.json({ success: true, message: 'Property updated successfully' });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// DELETE /api/properties/:id  (Admin — Soft Delete)
-router.delete('/:id', authAdmin, async (req, res) => {
-  try {
-    const [rows] = await pool.query(
-      'SELECT id FROM properties WHERE id = ? AND admin_id = ?',
-      [req.params.id, req.admin.id]
-    );
-    if (!rows.length)
-      return res.status(403).json({ success: false, message: 'Property not found or access denied' });
-
-    await pool.query('UPDATE properties SET is_active = 0 WHERE id = ?', [req.params.id]);
-    res.json({ success: true, message: 'Property removed successfully' });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    next(err);
   }
 });
 

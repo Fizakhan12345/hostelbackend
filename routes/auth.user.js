@@ -3,22 +3,16 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
 const pool = require('../config/db');
 const { requireAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
-const uploadDir = path.join(__dirname, '..', process.env.UPLOAD_DIR || 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+const { saveImage } = require('../services/storage');
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname) || '.jpg';
-    cb(null, `profile-${req.user.id}-${Date.now()}${ext}`);
-  },
-});
+// Photos are kept in memory for a moment, then saved by services/storage.js
+// (Cloudinary on the live site, the local uploads folder on your laptop).
+const storage = multer.memoryStorage();
 
 const upload = multer({
   storage,
@@ -146,7 +140,8 @@ router.post('/profile/picture', requireAuth, upload.single('profile_pic'), async
   try {
     if (!req.file) return res.status(400).json({ success: false, message: 'No image file received.' });
 
-    const publicUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+    const saved = await saveImage(req.file, `profile-${req.user.id}-${Date.now()}`, req);
+    const publicUrl = saved.url;
     await pool.query('UPDATE users SET profile_pic = :url WHERE id = :id', { url: publicUrl, id: req.user.id });
 
     res.json({ success: true, message: 'Profile picture updated.', profile_pic: publicUrl });

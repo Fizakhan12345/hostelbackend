@@ -23,13 +23,13 @@
 
 const express = require('express');
 const path = require('path');
-const fs = require('fs');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const rateLimit = require('express-rate-limit');
 const pool = require('../config/db');
+const { saveImage, removeImage } = require('../services/storage');
 
 const router = express.Router();
 const secret = () => process.env.JWT_ADMIN_SECRET || process.env.JWT_SECRET;
@@ -421,19 +421,10 @@ router.get('/properties', async (req, res, next) => {
 // uploads (same folder server.js serves at /uploads)
 const MAX_PHOTOS = 15;
 const PHOTO_CATEGORIES = ['room', 'amenities', 'washroom', 'food', 'building', 'other'];
-const uploadDir = path.join(__dirname, '..', process.env.UPLOAD_DIR || 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+// Photos are held in memory, then saved by services/storage.js
+// (Cloudinary on the live site, the local uploads folder on your laptop).
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadDir),
-    filename: (req, file, cb) => {
-      // the photo's document ID is also its file name: <doc_id>.jpg
-      const docId = crypto.randomUUID();
-      file.docId = docId;
-      const ext = (path.extname(file.originalname) || '.jpg').toLowerCase().replace(/[^.a-z0-9]/g, '');
-      cb(null, `${docId}${ext}`);
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: Number(process.env.MAX_FILE_SIZE) || 5 * 1024 * 1024, files: MAX_PHOTOS },
   fileFilter: (req, file, cb) => {
     const ok = /image\/(jpeg|jpg|png|webp)/.test(file.mimetype);
@@ -477,9 +468,8 @@ const IMAGE_MAP = {
   sort_order: ['sort_order', 'position', 'display_order'],
 };
 
-function cleanupFiles(files) {
-  for (const f of files || []) fs.unlink(f.path, () => {});
-}
+// memory uploads leave nothing on disk; saved photos are removed with removeImage()
+function cleanupFiles() {}
 
 router.post('/properties', (req, res, next) => {
   upload.array('images', MAX_PHOTOS)(req, res, (err) => {
@@ -487,6 +477,7 @@ router.post('/properties', (req, res, next) => {
       const message =
         err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE' ? `You can upload up to ${MAX_PHOTOS} photos.` :
         err.code === 'LIMIT_FILE_SIZE' ? 'Each photo must be 5 MB or smaller.' :
+        err.status === 413 || err.type === 'entity.too.large' ? 'The photos are too large together. Use smaller photos or fewer at once.' :
         err.message;
       cleanupFiles(req.files);
       return res.status(400).json({ success: false, message });
@@ -497,6 +488,7 @@ router.post('/properties', (req, res, next) => {
 
 async function createProperty(req, res, next) {
   const files = req.files || [];
+  const stored = []; // photos already saved — removed again if the listing fails
   let conn;
   try {
     // ── plan limit ──
@@ -567,6 +559,13 @@ async function createProperty(req, res, next) {
     }
     await ensureOwnTables();
 
+    // save the photos first (outside the database transaction)
+    for (const f of files) {
+      const docId = crypto.randomUUID(); // the photo's document ID is also its file name
+      const saved = await saveImage(f, docId, req);
+      stored.push({ ...saved, docId, file: f });
+    }
+
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
@@ -595,24 +594,23 @@ async function createProperty(req, res, next) {
     const photoMeta = parseJson(req.body.images_meta, []);
     const hasImagesTable = (await tables()).has('property_images');
     const savedPhotos = [];
-    for (let i = 0; i < files.length; i++) {
-      const f = files[i];
+    for (let i = 0; i < stored.length; i++) {
+      const { file: f, docId, url, fileName } = stored[i];
       const meta = Array.isArray(photoMeta) ? photoMeta[i] || {} : {};
       const category = PHOTO_CATEGORIES.includes(meta.category) ? meta.category : 'other';
       const caption = meta.caption ? String(meta.caption).slice(0, 150) : null;
-      const url = `${req.protocol}://${req.get('host')}/uploads/${f.filename}`;
 
       const [pr] = await conn.query(
         `INSERT INTO property_photos
            (doc_id, property_id, admin_id, category, caption, file_name, original_name, url, mime_type, size_bytes, is_cover, sort_order)
          VALUES (:doc, :pid, :aid, :cat, :cap, :fname, :orig, :url, :mime, :size, :cover, :sort)`,
         {
-          doc: f.docId, pid: propertyId, aid: req.owner.id, cat: category, cap: caption,
-          fname: f.filename, orig: String(f.originalname || '').slice(0, 255), url,
+          doc: docId, pid: propertyId, aid: req.owner.id, cat: category, cap: caption,
+          fname: fileName, orig: String(f.originalname || '').slice(0, 255), url,
           mime: f.mimetype, size: f.size, cover: i === 0 ? 1 : 0, sort: i,
         }
       );
-      savedPhotos.push({ id: pr.insertId, doc_id: f.docId, category, url });
+      savedPhotos.push({ id: pr.insertId, doc_id: docId, category, url });
 
       if (hasImagesTable) {
         const ins = await buildInsert('property_images', IMAGE_MAP, { property_id: propertyId, image_url: url, is_primary: i === 0 ? 1 : 0, sort_order: i });
@@ -644,7 +642,7 @@ async function createProperty(req, res, next) {
     res.status(201).json({ success: true, message: 'Listing published.', property_id: propertyId, photos: savedPhotos });
   } catch (err) {
     if (conn) await conn.rollback().catch(() => {});
-    cleanupFiles(files);
+    await Promise.all(stored.map((p) => removeImage(p)));
     if (err && err.code === 'ER_NO_REFERENCED_ROW_2') {
       return res.status(400).json({ success: false, message: 'The selected city or amenity no longer exists. Refresh and try again.' });
     }

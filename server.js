@@ -25,6 +25,7 @@ const allowedOrigins = [
   'http://localhost:4000',
   'https://belapur-hostel.vercel.app',
   'https://belapur-hostel-fiza.vercel.app',
+  'https://hostelkhojhoapp1.vercel.app',
   ...String(`${process.env.FRONTEND_URL || ''},${process.env.FRONTEND_URLS || ''}`)
     .split(',').map((s) => s.trim().replace(/\/+$/, '')).filter(Boolean),
 ];
@@ -33,7 +34,9 @@ app.use(cors({
     // no origin = server-to-server, curl, the Angular SSR server
     if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
     // Vercel preview deployments of the frontend project
-    if (/^https:\/\/belapur-hostel[a-z0-9-]*\.vercel\.app$/.test(origin)) return cb(null, true);
+    if (/^https:\/\/(belapur-hostel|hostelkhojhoapp1)[a-z0-9-]*\.vercel\.app$/.test(origin)) return cb(null, true);
+    // any preview link of a project in your Vercel team, e.g. https://xyz-fizakhan12345s-projects.vercel.app
+    if (/^https:\/\/[a-z0-9-]+-fizakhan12345s-projects\.vercel\.app$/.test(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS: ' + origin));
   },
   credentials: true,
